@@ -4,6 +4,8 @@ import logging
 import time
 import os
 import json
+import sys
+import socket
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,54 +42,79 @@ def setup_argparse():
     parser.add_argument("-p", "--pid", type=int, required=True, help="Process ID to monitor.")
     parser.add_argument("-d", "--duration", type=int, default=10, help="Duration (in seconds) to capture network connections. Default is 10 seconds.")
     parser.add_argument("-o", "--output", type=str, help="Output file to save the connection data (JSON format).")
-    parser.add_argument("-u", "--update-blocklist", action="store_true", help="Update malicious IP blocklist from a remote source (not implemented).")
     parser.add_argument("-l", "--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Set the logging level.")
     return parser.parse_args()
 
 
+def _addr_ip(addr):
+    if not addr:
+        return None
+    try:
+        return addr.ip
+    except Exception:
+        try: return addr[0]
+        except Exception: return None
+
+def _addr_port(addr):
+    if not addr:
+        return None
+    try:
+        return addr.port
+    except Exception:
+        try: return addr[1]
+        except Exception: return None
+
+def _protocol_name(conn_type):
+    try:
+        value = int(conn_type)
+    except Exception:
+        name = str(conn_type)
+        return "TCP" if "STREAM" in name else ("UDP" if "DGRAM" in name else name)
+    return {int(socket.SOCK_STREAM): "TCP", int(socket.SOCK_DGRAM): "UDP"}.get(value, str(value))
+
 def analyze_connections(pid, duration):
-    """Captures and analyzes network connections for a given PID."""
+    """Returns a list of distinct connections, or None if the process cannot be read."""
     try:
         process = psutil.Process(pid)
     except psutil.NoSuchProcess:
         logging.error(f"Process with PID {pid} not found.")
-        return []
+        return None
     except psutil.AccessDenied:
-        logging.error(f"Access denied when trying to access process with PID {pid}.  Run with elevated privileges.")
-        return []
+        logging.error(f"Access denied when trying to access process with PID {pid}.  ")
+        return None
     except Exception as e:
         logging.error(f"An unexpected error occurred while accessing process with PID {pid}: {e}")
-        return []
-
+        return None
     logging.info(f"Monitoring network connections for PID {pid} for {duration} seconds...")
     start_time = time.time()
     connections = []
-
+    seen = set()
     while time.time() - start_time < duration:
         try:
             new_connections = process.connections(kind='inet')
             for conn in new_connections:
-                connection_details = {
-                    "local_address": conn.laddr.address,
-                    "local_port": conn.laddr.port,
-                    "remote_address": conn.raddr.address if conn.raddr else None,
-                    "remote_port": conn.raddr.port if conn.raddr else None,
-                    "protocol": conn.type,  # socket.SOCK_STREAM (TCP) or socket.SOCK_DGRAM (UDP)
-                    "status": conn.status, # TCP state (e.g., ESTABLISHED, TIME_WAIT)
-                    "is_malicious": conn.raddr.address in MALICIOUS_IPS if conn.raddr else False
+                details = {
+                    "local_address": _addr_ip(conn.laddr),
+                    "local_port": _addr_port(conn.laddr),
+                    "remote_address": _addr_ip(conn.raddr) if conn.raddr else None,
+                    "remote_port": _addr_port(conn.raddr) if conn.raddr else None,
+                    "protocol": _protocol_name(conn.type),
+                    "status": conn.status,
+                    "is_malicious": (_addr_ip(conn.raddr) in MALICIOUS_IPS) if conn.raddr else False
                 }
-                connections.append(connection_details)
+                key = (details["local_address"], details["local_port"], details["remote_address"], details["remote_port"], details["protocol"], details["status"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                connections.append(details)
         except psutil.NoSuchProcess:
              logging.error(f"Process with PID {pid} no longer exists.")
              return connections
         except psutil.AccessDenied:
-            logging.warning(f"Access denied while retrieving connections for PID {pid}.  Run with elevated privileges or investigate.")
-            # Non-fatal, continue monitoring.  Could be intermittent.
+            logging.warning(f"Access denied while retrieving connections for PID {pid}.")
         except Exception as e:
             logging.error(f"An error occurred while retrieving connections for PID {pid}: {e}")
-
-        time.sleep(1) # Check connections every 1 second
-
+        time.sleep(1)
     logging.info(f"Finished monitoring PID {pid}.")
     return connections
 
@@ -101,45 +128,45 @@ def save_to_json(data, output_file):
         logging.error(f"Error saving data to {output_file}: {e}")
 
 def main():
-    """Main function to execute the network connection analyzer."""
     args = setup_argparse()
-
-    # Set logging level
     logging.getLogger().setLevel(args.log_level.upper())
-
     pid = args.pid
     duration = args.duration
     output_file = args.output
-
     if pid <= 0:
         logging.error("PID must be a positive integer.")
-        return
-
+        sys.exit(1)
     if duration <= 0:
         logging.error("Duration must be a positive integer.")
-        return
-
-    # Input validation complete, continue execution
-    logging.debug(f"Starting analysis with PID: {pid}, Duration: {duration}, Output file: {output_file}")
-
+        sys.exit(1)
+    if not os.path.exists(MALICIOUS_IPS_FILE):
+        logging.info("malicious_ips.json not found in the folder this tool was started from. Malicious flagging is off for this run: no IPs will be flagged.")
+        print("malicious_ips.json not found in the starting folder. Malicious flagging is off for this run.")
+    else:
+        logging.info(f"Loaded {len(MALICIOUS_IPS)} malicious IP(s) from malicious_ips.json in the starting folder.")
     connections = analyze_connections(pid, duration)
-
+    if connections is None:
+        logging.error(f"Could not read connections for PID {pid}.")
+        if output_file:
+            save_to_json([], output_file)
+        sys.exit(1)
     if connections:
         logging.info(f"Found {len(connections)} network connections.")
-
-        # Print connections and flag malicious ones
         for conn in connections:
             log_message = f"Connection: Local {conn['local_address']}:{conn['local_port']}, Remote {conn['remote_address']}:{conn['remote_port']}, Protocol: {conn['protocol']}, Status: {conn['status']}"
             if conn['is_malicious']:
                 log_message += " - **MALICIOUS IP DETECTED!**"
-                logging.warning(log_message)  # Log malicious connections as warnings
+                logging.warning(log_message)
             else:
                 logging.info(log_message)
-
         if output_file:
             save_to_json(connections, output_file)
     else:
-        logging.info("No network connections found or an error occurred.")
+        logging.info("No network connections found.")
+        print("No network connections found.")
+        if output_file:
+            save_to_json([], output_file)
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
