@@ -34,6 +34,9 @@ def load_malicious_ips():
         return set()
 
 
+# The blocklist loads once, at import, from a path relative to the folder
+# the tool was started in, not the folder the script lives in. Starting
+# the tool somewhere else silently means a different list, or none.
 MALICIOUS_IPS = load_malicious_ips()
 
 def setup_argparse():
@@ -46,6 +49,10 @@ def setup_argparse():
     return parser.parse_args()
 
 
+# psutil address values are namedtuples with .ip and .port on current
+# versions, but plain tuples come back on some platforms and older
+# versions. I try the attribute first and fall back to indexing, and a
+# value that fits neither shape becomes None instead of raising.
 def _addr_ip(addr):
     if not addr:
         return None
@@ -64,6 +71,9 @@ def _addr_port(addr):
         try: return addr[1]
         except Exception: return None
 
+# conn.type is not one stable type either: it can arrive as an int, an
+# enum, or a string depending on platform. I normalise through int when
+# that works and pattern match the string form when it does not.
 def _protocol_name(conn_type):
     try:
         value = int(conn_type)
@@ -102,6 +112,9 @@ def analyze_connections(pid, duration):
                     "status": conn.status,
                     "is_malicious": (_addr_ip(conn.raddr) in MALICIOUS_IPS) if conn.raddr else False
                 }
+                # Status is part of the dedupe key on purpose. The same socket seen in
+                # two states is two entries, because the state change is itself part of
+                # what a capture over time should show.
                 key = (details["local_address"], details["local_port"], details["remote_address"], details["remote_port"], details["protocol"], details["status"])
                 if key in seen:
                     continue
@@ -109,8 +122,14 @@ def analyze_connections(pid, duration):
                 connections.append(details)
         except psutil.NoSuchProcess:
              logging.error(f"Process with PID {pid} no longer exists.")
+             # The process dying mid-capture returns what was gathered, not None.
+             # None is reserved for never being able to read the process at all, and
+             # main treats the two differently.
              return connections
         except psutil.AccessDenied:
+            # Access denied inside the loop only warns and keeps polling, unlike the
+            # same error before the loop, which gives up. A process whose owner
+            # changes, or a transient permission hiccup, can become readable again.
             logging.warning(f"Access denied while retrieving connections for PID {pid}.")
         except Exception as e:
             logging.error(f"An error occurred while retrieving connections for PID {pid}: {e}")
@@ -118,6 +137,9 @@ def analyze_connections(pid, duration):
     logging.info(f"Finished monitoring PID {pid}.")
     return connections
 
+# A failed save is logged and swallowed here. On the success path that
+# means the tool can exit 0 with no file written, which I note as a gap:
+# the caller asked for a file and the exit code does not say it is absent.
 def save_to_json(data, output_file):
     """Saves the connection data to a JSON file."""
     try:
@@ -145,6 +167,9 @@ def main():
     else:
         logging.info(f"Loaded {len(MALICIOUS_IPS)} malicious IP(s) from malicious_ips.json in the starting folder.")
     connections = analyze_connections(pid, duration)
+    # Even a failed or empty capture writes an empty JSON list when an
+    # output file was asked for, so a downstream reader finds a valid file
+    # instead of a missing one. The exit code carries the failure.
     if connections is None:
         logging.error(f"Could not read connections for PID {pid}.")
         if output_file:
